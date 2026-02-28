@@ -112,12 +112,43 @@ $$
 
 ## 编码器
 
-LSTM 读取输入序列，输出最终的 **隐藏状态(hieedn)** 和 **细胞状态(cell)** 作为上下文向量。
+编码器读取输入序列，输出最终的 **隐藏状态(hieedn)** 和 **细胞状态(cell)** 作为上下文向量赋值给解码器中的初始状态。
 
 ``` python
 class Encoder(nn.Module):
     def __init__(self, vocab_size, hidden_size, num_layers):
         super(Encoder, self).__init__()
+        # nn.Embedding 是 PyTorch 常用模块，负责将输入序列转为向量表示
+        self.embedding = nn.Embedding(
+            num_embeddings=vocab_size, # 词表大小，即词汇表中不同词元的总数
+            embedding_dim=hidden_size # 嵌入维度，即每个词元对应的向量维度
+        )
+        # nn.LSTM 是长短期记忆网络，用于捕捉序列中的长期依赖关系
+        self.rnn = nn.LSTM(
+            input_size=hidden_size, # 输入特征维度，需与embedding_dim一致
+            hidden_size=hidden_size, # 隐藏层状态维度，决定输出向量大小
+            num_layers=num_layers, # LSTM堆叠层数，多层可提取更抽象特征
+            batch_first=True, # 输入张量格式为 (batch, seq_len, feature)
+            bidirectional=False # LSTM，若为True则变为双向LSTM
+        )
+
+    def forward(self, x):
+        embedded = self.embedding(x) # (batch_size, seq_length) -> (batch_size, seq_length, hidden_size)
+        # 返回最终状态，供解码器使用以初始化其隐藏状态
+        # hidden(num_layers, batch_size, hidden_size)
+        # cell(num_layers, batch_size, hidden_size)
+        _, (hidden, cell) = self.rnn(embedded)
+        return hidden, cell
+```
+
+## 解码器
+
+在每一个时间步中，解码器接收一个词元和前一步的状态，然后输出预测和新的状态。
+
+``` python
+class Decoder(nn.Module):
+    def __init__(self, vocab_size, hidden_size, num_layers):
+        super(Decoder, self).__init__()
         self.embedding = nn.Embedding(
             num_embeddings=vocab_size,
             embedding_dim=hidden_size
@@ -126,14 +157,140 @@ class Encoder(nn.Module):
             input_size=hidden_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
-            batch_first=True,
-            bidirectional=False
+            batch_first=True
         )
+        # nn.Linear 是全连接层，负责将LSTM输出映射到词汇表大小，用于词元预测
+        self.fc = nn.Linear(in_features=hidden_size, out_features=vocab_size)
 
-    def forward(self, x):
-        embedded = self.embedding(x)
-        _, (hidden, cell) = self.rnn(embedded)
-        return hidden, cell
+    def forward(self, x, hidden, cell):
+	    # 将批量的当前时间步的 token 转换为解码器期望输入格式
+        x = x.unsqueeze(1) # (batch_size) -> (batch_size, 1)
+
+        embedded = self.embedding(x) # (batch_size, 1) -> (batch_size, 1, hidden_size)
+        # 返回当前步的输出和更新后的状态
+        # outputs(batch_size, 1, hidden_size)
+        # hidden(batch_size, hidden_size)
+        # cell(batch_size, hidden_size)
+        outputs, (hidden, cell) = self.rnn(embedded, (hidden, cell))
+
+        predictions = self.fc(outputs.squeeze(1)) # (batch_size, 1, hidden_size) -> (batch_size, vocab_size)
+        return predictions, hidden, cell
 ```
 
-其中，nn.Embedding 是 PyTorch 常用模块，负责将输入序列转为向量表示，
+## Seq2Seq 包装模块
+
+将编码器和解码器连接起来，并实现**训练**逻辑。
+
+``` python
+class Seq2Seq(nn.Module):
+    def __init__(self, encoder, decoder, device):
+        super(Seq2Seq, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.device = device
+
+    def forward(self, src, trg, teacher_forcing_ratio=0.5):
+        # 获取批次大小和目标序列长度
+        batch_size = src.shape[0]
+        trg_len = trg.shape[1]
+        trg_vocab_size = self.decoder.fc.out_features
+		
+		# 存储每个时间步的预测结果
+        outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(self.device)
+        hidden, cell = self.encoder(src)
+
+        # 第一个输入是 <SOS>
+        input = trg[:, 0]
+
+        for t in range(1, trg_len):
+            output, hidden, cell = self.decoder(input, hidden, cell)
+            # 保存当前时间步的预测结果
+            outputs[:, t, :] = output
+
+            # 决定是否使用 Teacher Forcing
+            teacher_force = random.random() < teacher_forcing_ratio
+            top1 = output.argmax(1)
+            # 如果 teacher_force，下一个输入是真实值；否则是模型的预测值
+            input = trg[:, t] if teacher_force else top1
+
+        return outputs
+```
+
+## 高效的推理实现
+
+将**上一步的输出词元**和**上一步的隐藏状态**传入解码器，进行单步计算，然后用返回的新状态覆盖旧状态。
+
+``` python
+    def greedy_decode(self, src, max_len=12, sos_idx=1, eos_idx=2):
+        """推理模式下的高效贪心解码。"""
+        self.eval()
+        with torch.no_grad():
+            hidden, cell = self.encoder(src)
+            trg_indexes = [sos_idx]
+            for _ in range(max_len):
+                # 1. 输入只有上一个时刻的词元
+                trg_tensor = torch.LongTensor([trg_indexes[-1]]).to(self.device)
+                
+                # 2. 解码一步，并传入上一步的状态
+                output, hidden, cell = self.decoder(trg_tensor, hidden, cell)
+                
+                # 3. 获取当前步的预测，并更新状态用于下一步
+                pred_token = output.argmax(1).item()
+                trg_indexes.append(pred_token)
+                if pred_token == eos_idx:
+                    break
+        return trg_indexes
+```
+
+## 上下文向量的另一种用法
+
+将上下文向量作为解码器**每个时间步的额外输入**，持续地为解码器提供全局信息。
+
+``` python
+class DecoderAlt(nn.Module):
+    def __init__(self, vocab_size, hidden_size, num_layers):
+        super(DecoderAlt, self).__init__()
+        self.embedding = nn.Embedding(
+            num_embeddings=vocab_size,
+            embedding_dim=hidden_size
+        )
+        # 主要改动 1: RNN的输入维度是 词嵌入+上下文向量
+        self.rnn = nn.LSTM(
+            input_size=hidden_size + hidden_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True
+        )
+        self.fc = nn.Linear(in_features=hidden_size, out_features=vocab_size)
+
+    def forward(self, x, hidden_ctx, hidden, cell):
+        x = x.unsqueeze(1)
+        embedded = self.embedding(x)
+
+        # 主要改动 2: 将上下文向量与当前输入拼接
+        # 这里简单地取编码器最后一层的 hidden state 作为上下文代表
+        context = hidden_ctx[-1].unsqueeze(1).repeat(1, embedded.shape[1], 1)
+        rnn_input = torch.cat((embedded, context), dim=2)
+
+        # 解码器的初始状态 hidden, cell 在第一步可设为零；之后需传递并更新上一步状态
+        outputs, (hidden, cell) = self.rnn(rnn_input, (hidden, cell))
+        predictions = self.fc(outputs.squeeze(1))
+        return predictions, hidden, cell
+```
+
+# 应用与局限
+
+## 广泛性
+
+本质上定义了一个“将一种数据形态转换为另一种数据形态”的通用范式，所以它的应用远不止于文本到文本的任务。
+
+也可以用在**语音识别（Audio-to-Text）**、**图像描述生成（Image-to-Text）**、**文本到语音（Text-to-Speech, TTS）**、**问答系统（QA）中**。
+
+## 瓶颈
+
+编码器和解码器之间唯一的沟通桥梁就是一个**固定长度**的上下文向量 C。编码器必须将输入序列的所有信息，无论其长短，都压缩到这个向量中。
+
+当输入句子很长时，这个最终的上下文向量 C 依然很难承载全部的语义细节，模型可能会“遗忘”掉句子开头的关键信息，导致生成质量下降。
+
+即使采用**将上下文向量作为解码器每个时间步额外输入**的策略，因为每个时间步输入的都是**同一个** C，模型仍然无法学会有选择性地、有侧重地利用输入信息。
+
